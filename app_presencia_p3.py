@@ -4,7 +4,8 @@ APP PRESENCIA ACTUAL POR PLANTA - CRECE PERSONAS
 Objetivo:
 - Mostrar qué empleados están trabajando ahora mismo en una planta concreta.
 - No usa filtros visibles.
-- La planta se calcula por el último fichaje abierto, no por la sede asignada al empleado.
+- La planta se calcula por el último fichaje abierto.
+- Si el fichaje no trae centro/ubicación/terminal identificable, se usa como fallback la sede asignada del empleado.
 - Preparada para turnos nocturnos: consulta desde ayer hasta hoy.
 
 Uso recomendado:
@@ -15,10 +16,6 @@ Uso recomendado:
 2) En cada archivo cambiar PLANTA_OBJETIVO:
    - P2 para COMARCA II
    - P3 para UHARTE
-
-3) Ejecutar:
-   streamlit run app_presencia_p2.py
-   streamlit run app_presencia_p3.py
 
 Secrets esperados en .streamlit/secrets.toml:
 API_TOKEN = "..."
@@ -32,7 +29,6 @@ import base64
 import json
 import os
 import re
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -61,12 +57,12 @@ PLANTA_OBJETIVO = "P3"
 
 PLANTAS = {
     "P2": {
-        "titulo": "Presencia actual - P2 COMARCA II",
+        "titulo": "P2 COMARCA II",
         "nombre": "P2 COMARCA II",
         "keywords": ["P2", "COMARCA", "COMARCA II"],
     },
     "P3": {
-        "titulo": "Presencia actual - P3 UHARTE",
+        "titulo": "P3 UHARTE",
         "nombre": "P3 UHARTE",
         "keywords": ["P3", "UHARTE", "HUARTE"],
     },
@@ -75,14 +71,10 @@ PLANTAS = {
 TIMEZONE = "Europe/Madrid"
 
 # Ventana de seguridad para turnos nocturnos.
-# Aunque la consulta sea del día en curso a nivel operativo, internamente miramos desde ayer
-# para no perder entradas abiertas que cruzan medianoche.
 NOCTURNAL_LOOKBACK_DAYS = 1
 
-# Si por error alguien queda con una entrada abierta durante demasiadas horas,
-# lo marcamos internamente como aviso. No se oculta, porque sigue siendo el último estado real.
+# Aviso interno en la validación técnica si queda una entrada abierta demasiadas horas.
 MAX_OPEN_SHIFT_HOURS_WARNING = 18
-
 
 
 # ============================================================
@@ -140,6 +132,39 @@ def human_full_name(emp: Dict[str, Any]) -> str:
     return " ".join(str(p).strip() for p in parts if p not in [None, "", "None"]).strip()
 
 
+def get_record_id(record: Dict[str, Any]) -> str:
+    for key in ["id", "ID", "Id"]:
+        value = record.get(key)
+        if value not in [None, "", "None"]:
+            return str(value).strip()
+    return ""
+
+
+def get_record_name(record: Dict[str, Any]) -> str:
+    for key in ["nombre", "Nombre", "name", "Name"]:
+        value = record.get(key)
+        if value not in [None, "", "None"]:
+            return str(value).strip()
+    return ""
+
+
+def build_id_name_lookup(records: List[Dict[str, Any]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for record in records:
+        record_id = get_record_id(record)
+        record_name = get_record_name(record)
+        if record_id and record_name:
+            lookup[record_id] = record_name
+    return lookup
+
+
+def resolve_lookup_value(value: Any, lookup: Dict[str, str]) -> str:
+    if value in [None, "", "None"]:
+        return ""
+    value_str = str(value).strip()
+    return lookup.get(value_str, value_str)
+
+
 # ============================================================
 # DESENCRIPTADO CRECE
 # ============================================================
@@ -164,7 +189,6 @@ def deserialize_php_or_json(raw_text: str) -> Any:
     if raw_text == "":
         return None
 
-    # Fallback JSON directo
     if raw_text.startswith("{") or raw_text.startswith("["):
         try:
             return json.loads(raw_text)
@@ -172,9 +196,7 @@ def deserialize_php_or_json(raw_text: str) -> Any:
             pass
 
     if phpserialize is None:
-        raise RuntimeError(
-            "Falta la dependencia phpserialize. Instala: pip install phpserialize"
-        )
+        raise RuntimeError("Falta la dependencia phpserialize. Instala: pip install phpserialize")
 
     try:
         return phpserialize.loads(
@@ -231,7 +253,6 @@ def to_records(data: Any) -> List[Dict[str, Any]]:
         return [x for x in data if isinstance(x, dict)]
 
     if isinstance(data, dict):
-        # Puede venir como dict indexado 0,1,2 o como dict por NIF.
         values = list(data.values())
         if values and all(isinstance(v, dict) for v in values):
             return values
@@ -268,12 +289,19 @@ class CreceClient:
         decrypted = decrypt_crece_payload(resp.text, self.app_key_b64)
         return to_records(decrypted)
 
+    def get_export(self, endpoint: str, timeout: int = 60) -> List[Dict[str, Any]]:
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        resp = self.session.get(url, timeout=timeout)
+        resp.raise_for_status()
+        decrypted = decrypt_crece_payload(resp.text, self.app_key_b64)
+        return to_records(decrypted)
+
     def export_fichajes(self, fecha_inicio: str, fecha_fin: str, order: str = "asc") -> List[Dict[str, Any]]:
         """
         Intenta traer todos los fichajes del periodo.
 
-        Nota: el manual documenta el parámetro nif. En algunas instalaciones CRECE permite no enviarlo
-        para devolver todos los fichajes; si en vuestra intranet no lo permite, usaremos fallback por empleado.
+        El manual documenta el parámetro nif. En algunas instalaciones CRECE permite no enviarlo
+        para devolver todos los fichajes; si no lo permite, usamos fallback por empleado.
         """
         return self.post_export(
             "exportacion/fichajes",
@@ -303,6 +331,12 @@ class CreceClient:
             },
         )
 
+    def export_departamentos(self) -> List[Dict[str, Any]]:
+        return self.get_export("exportacion/departamentos")
+
+    def export_sedes(self) -> List[Dict[str, Any]]:
+        return self.get_export("exportacion/sedes")
+
     def export_fichajes_con_fallback(
         self,
         fecha_inicio: str,
@@ -321,18 +355,20 @@ class CreceClient:
         except Exception:
             all_fichajes: List[Dict[str, Any]] = []
             nifs = sorted({get_empleado_nif(emp) for emp in empleados if get_empleado_nif(emp)})
+
             for nif in nifs:
                 try:
                     fichajes_emp = self.export_fichajes_empleado(fecha_inicio, fecha_fin, nif, order=order)
+
                     for f in fichajes_emp:
-                        # Si CRECE no devuelve NIF en cada fichaje, lo añadimos nosotros porque sabemos
-                        # de qué empleado viene la consulta.
                         if not get_fichaje_nif(f):
                             f["nif"] = nif
-                        all_fichajes.extend(fichajes_emp)
+
+                    all_fichajes.extend(fichajes_emp)
+
                 except Exception:
-                    # No paramos toda la app por un empleado puntual. El detalle se puede revisar en logs si hace falta.
                     continue
+
             return all_fichajes, "por_empleado"
 
 
@@ -340,25 +376,7 @@ class CreceClient:
 # LÓGICA DE PRESENCIA
 # ============================================================
 
-def detectar_planta_fichaje(fichaje: Dict[str, Any]) -> str:
-    """Detecta P2/P3 usando centro, ubicacion y terminal del fichaje."""
-    text = normalize_text(" ".join([
-        str(fichaje.get("centro", "")),
-        str(fichaje.get("ubicacion", "")),
-        str(fichaje.get("terminal", "")),
-    ]))
-
-    for planta_id, cfg in PLANTAS.items():
-        for keyword in cfg["keywords"]:
-            if normalize_text(keyword) in text:
-                return planta_id
-
-    return "DESCONOCIDA"
-
-
 def get_fichaje_nif(fichaje: Dict[str, Any]) -> str:
-    # El manual de exportación no lista nif en la respuesta, pero en integraciones reales suele venir.
-    # Dejamos varios posibles nombres para hacerlo robusto.
     for key in ["nif", "NIF", "dni", "documento", "nif_empleado", "empleado_nif"]:
         value = fichaje.get(key)
         if value:
@@ -382,6 +400,67 @@ def get_num_empleado(emp: Dict[str, Any]) -> str:
     return ""
 
 
+def get_departamento_value(emp: Dict[str, Any]) -> str:
+    for key in ["departamento", "Departamento", "departamento_id", "Departamento_id"]:
+        value = emp.get(key)
+        if value not in [None, "", "None"]:
+            return str(value).strip()
+    return ""
+
+
+def get_sede_value(emp: Dict[str, Any]) -> str:
+    for key in ["sede", "Sede", "sede_id", "Sede_id"]:
+        value = emp.get(key)
+        if value not in [None, "", "None"]:
+            return str(value).strip()
+    return ""
+
+
+def detectar_planta_en_texto(text: str) -> str:
+    normalized = normalize_text(text)
+    for planta_id, cfg in PLANTAS.items():
+        for keyword in cfg["keywords"]:
+            if normalize_text(keyword) in normalized:
+                return planta_id
+    return "DESCONOCIDA"
+
+
+def detectar_planta_fichaje(
+    fichaje: Dict[str, Any],
+    emp: Optional[Dict[str, Any]] = None,
+    sede_lookup: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str]:
+    """
+    Detecta P2/P3.
+
+    Prioridad:
+    1) Datos del fichaje: centro, ubicación o terminal.
+    2) Fallback: sede asignada del empleado.
+
+    Devuelve:
+    - planta detectada
+    - fuente usada para detectarla
+    """
+    text_fichaje = " ".join([
+        str(fichaje.get("centro", "")),
+        str(fichaje.get("ubicacion", "")),
+        str(fichaje.get("terminal", "")),
+    ])
+
+    planta = detectar_planta_en_texto(text_fichaje)
+    if planta != "DESCONOCIDA":
+        return planta, "fichaje"
+
+    if emp:
+        sede_raw = get_sede_value(emp)
+        sede_nombre = resolve_lookup_value(sede_raw, sede_lookup or {})
+        planta = detectar_planta_en_texto(f"{sede_raw} {sede_nombre}")
+        if planta != "DESCONOCIDA":
+            return planta, "sede_empleado"
+
+    return "DESCONOCIDA", "sin_detectar"
+
+
 def build_employee_lookup(empleados: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     lookup: Dict[str, Dict[str, Any]] = {}
     for emp in empleados:
@@ -394,6 +473,8 @@ def build_employee_lookup(empleados: List[Dict[str, Any]]) -> Dict[str, Dict[str
 def calcular_presencia_actual(
     fichajes: List[Dict[str, Any]],
     empleados: List[Dict[str, Any]],
+    departamentos_lookup: Dict[str, str],
+    sedes_lookup: Dict[str, str],
     planta_objetivo: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -412,11 +493,15 @@ def calcular_presencia_actual(
         if not nif or fecha is None or pd.isna(fecha) or not direccion:
             continue
 
+        emp = emp_lookup.get(nif, {})
+        planta_fichaje, fuente_planta = detectar_planta_fichaje(f, emp, sedes_lookup)
+
         rows.append({
             "nif": nif,
             "fecha": fecha,
             "direccion": direccion,
-            "planta_fichaje": detectar_planta_fichaje(f),
+            "planta_fichaje": planta_fichaje,
+            "fuente_planta": fuente_planta,
             "centro": f.get("centro", ""),
             "ubicacion": f.get("ubicacion", ""),
             "terminal": f.get("terminal", ""),
@@ -444,10 +529,13 @@ def calcular_presencia_actual(
 
         nombre = human_full_name(emp) or nif
         num_empleado = get_num_empleado(emp)
-        departamento = emp.get("departamento") or emp.get("Departamento") or ""
-        sede_ficha = emp.get("sede") or emp.get("Sede") or ""
 
-        horas_abierto = None
+        departamento_raw = get_departamento_value(emp)
+        departamento = resolve_lookup_value(departamento_raw, departamentos_lookup)
+
+        sede_raw = get_sede_value(emp)
+        sede_ficha = resolve_lookup_value(sede_raw, sedes_lookup)
+
         aviso = ""
         if direccion == "ENTRADA":
             try:
@@ -463,6 +551,7 @@ def calcular_presencia_actual(
             "Nº empleado": num_empleado,
             "Último movimiento": direccion.lower(),
             "Planta detectada": planta_actual,
+            "Fuente planta": row.get("fuente_planta", ""),
             "Sede ficha": sede_ficha,
             "Departamento": departamento,
             "Centro": row.get("centro", ""),
@@ -476,11 +565,6 @@ def calcular_presencia_actual(
                 "Empleado": nombre,
                 "Nº empleado": num_empleado,
                 "Departamento": departamento,
-                "Sede ficha": sede_ficha,
-                "Centro fichaje": row.get("centro", ""),
-                "Ubicación": row.get("ubicacion", ""),
-                "Terminal": row.get("terminal", ""),
-                "Aviso": aviso,
             })
 
     df_presencia = pd.DataFrame(output_rows)
@@ -503,16 +587,13 @@ def render_header(planta_objetivo: str) -> None:
         page_icon="🏭",
         layout="wide",
     )
-
     st.title(cfg["titulo"])
-    # Pantalla limpia: sin texto descriptivo bajo el título.
 
 
-def render_status_cards(total: int, updated_at: pd.Timestamp, desde: str, hasta: str) -> None:
-    c1, c2, c3 = st.columns(3)
+def render_status_cards(total: int, updated_at: pd.Timestamp) -> None:
+    c1, c2 = st.columns(2)
     c1.metric("Trabajando ahora", total)
     c2.metric("Última actualización", updated_at.strftime("%H:%M:%S"))
-    c3.metric("Ventana consultada", f"{desde} → {hasta}")
 
 
 def main() -> None:
@@ -530,29 +611,39 @@ def main() -> None:
     desde_str = date_str(fecha_desde)
     hasta_str = date_str(fecha_hasta)
 
-    left, _ = st.columns([1, 4])
-    with left:
-        refresh = st.button("Actualizar ahora", use_container_width=True)
+    refresh = st.button("Actualizar ahora", use_container_width=False)
 
     if refresh:
         try:
             with st.spinner("Consultando CRECE Personas..."):
                 client = CreceClient()
+
                 empleados = client.export_empleados()
+                departamentos = client.export_departamentos()
+                sedes = client.export_sedes()
+
+                departamentos_lookup = build_id_name_lookup(departamentos)
+                sedes_lookup = build_id_name_lookup(sedes)
+
                 fichajes, modo_consulta = client.export_fichajes_con_fallback(
                     desde_str,
                     hasta_str,
                     empleados,
                     order="asc",
                 )
-                df_presencia, df_debug = calcular_presencia_actual(fichajes, empleados, planta_objetivo)
+
+                df_presencia, df_debug = calcular_presencia_actual(
+                    fichajes=fichajes,
+                    empleados=empleados,
+                    departamentos_lookup=departamentos_lookup,
+                    sedes_lookup=sedes_lookup,
+                    planta_objetivo=planta_objetivo,
+                )
 
             st.session_state["presencia_resultado"] = {
                 "df_presencia": df_presencia,
                 "df_debug": df_debug,
                 "updated_at": now_madrid(),
-                "desde_str": desde_str,
-                "hasta_str": hasta_str,
                 "modo_consulta": modo_consulta,
             }
 
@@ -566,35 +657,22 @@ def main() -> None:
             return
 
     resultado = st.session_state.get("presencia_resultado")
-
     if not resultado:
-        st.info("Pulsa Actualizar ahora para consultar la presencia actual.")
         return
 
     df_presencia = resultado["df_presencia"]
     df_debug = resultado["df_debug"]
     updated_at = resultado["updated_at"]
-    desde_resultado = resultado["desde_str"]
-    hasta_resultado = resultado["hasta_str"]
 
     total = 0 if df_presencia.empty else len(df_presencia)
-    render_status_cards(total, updated_at, desde_resultado, hasta_resultado)
+    render_status_cards(total, updated_at)
 
     st.divider()
 
     if df_presencia.empty:
         st.success(f"No hay empleados trabajando ahora mismo en {PLANTAS[planta_objetivo]['nombre']}.")
     else:
-        visible_cols = [
-            "Empleado",
-            "Nº empleado",
-            "Departamento",
-            "Sede ficha",
-            "Centro fichaje",
-            "Ubicación",
-            "Terminal",
-            "Aviso",
-        ]
+        visible_cols = ["Empleado", "Nº empleado", "Departamento"]
         existing_cols = [c for c in visible_cols if c in df_presencia.columns]
         st.dataframe(
             df_presencia[existing_cols],
@@ -603,9 +681,7 @@ def main() -> None:
         )
 
     with st.expander("Validación técnica del cálculo", expanded=False):
-        st.write(
-            "Esta tabla no es para recepción. Sirve para comprobar el último movimiento detectado por empleado."
-        )
+        st.write("Esta tabla sirve para comprobar el último movimiento detectado por empleado.")
         if df_debug.empty:
             st.warning("No hay fichajes válidos en la ventana consultada.")
         else:
