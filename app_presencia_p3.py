@@ -6,8 +6,8 @@ Objetivo:
 - No usa filtros visibles.
 - La planta se calcula por el último fichaje abierto.
 - Prioridad de detección de planta:
-  1) tipo de fichaje / nombre del tipo de fichaje
-  2) centro / ubicacion / terminal del fichaje
+  1) tipo del fichaje si viene como texto P2/P3 o si coincide con mapeo manual
+  2) centro / ubicación / terminal del fichaje
   3) coordenadas GPS del fichaje móvil contra la geocerca de P2/P3
   4) sede asignada del empleado como último fallback
 - Preparada para turnos nocturnos: consulta desde ayer hasta hoy.
@@ -73,12 +73,17 @@ NOCTURNAL_LOOKBACK_DAYS = 1
 GEOFENCE_RADIUS_METERS = 500
 
 # Coordenadas manuales de planta.
-# Importante: si aquí hay coordenadas, tienen prioridad sobre /exportacion/sedes.
-# P3 queda fijada con la ubicación real que has verificado en CRECE/Google Maps.
+# P3 corregida con la ubicación real que has sacado desde CRECE/Google Maps.
+# Para P2, rellena aquí la coordenada real cuando la tengas.
 PLANT_COORDS_MANUAL: Dict[str, Optional[Tuple[float, float]]] = {
     "P2": None,
     "P3": (42.920013, -1.982135),
 }
+
+# Mapeo manual opcional de tipos de fichaje si en la API el campo tipo viene como ID numérico.
+# Ejemplo, si descubres que tipo=7 es P3:
+# TIPO_FICHAJE_TO_PLANTA = {"7": "P3", "8": "P2"}
+TIPO_FICHAJE_TO_PLANTA: Dict[str, str] = {}
 
 MAX_OPEN_SHIFT_HOURS_WARNING = 18
 
@@ -182,16 +187,12 @@ def parse_float(value: Any) -> Optional[float]:
 def normalize_lat_lon(lat: Optional[float], lon: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
     """
     Normaliza coordenadas.
-    En el manual aparece una posible inversión de texto en sede:
-    - latitud: Longitud
-    - longitud: Latitud
     Para Navarra, normalmente latitud ronda 42.x y longitud ronda -1.x.
     Si detectamos valores claramente cruzados, los intercambiamos.
     """
     if lat is None or lon is None:
         return lat, lon
 
-    # Caso probable de coordenadas cruzadas en Navarra / España norte.
     if abs(lat) < 10 and 35 <= abs(lon) <= 45:
         return lon, lat
 
@@ -388,10 +389,6 @@ class CreceClient:
     def export_sedes(self) -> List[Dict[str, Any]]:
         return self.get_export("exportacion/sedes")
 
-    def export_tipos_fichaje(self) -> List[Dict[str, Any]]:
-        # El manual documenta este endpoint como POST sin parámetros obligatorios.
-        return self.post_export("exportacion/tipos-fichaje", {})
-
     def export_fichajes_con_fallback(
         self,
         fecha_inicio: str,
@@ -463,6 +460,14 @@ def get_sede_value(emp: Dict[str, Any]) -> str:
     return ""
 
 
+def get_tipo_fichaje_value(fichaje: Dict[str, Any]) -> str:
+    for key in ["tipo", "Tipo", "tipo_fichaje", "tipoFichaje", "nombre_tipo", "tipo_nombre"]:
+        value = fichaje.get(key)
+        if value not in [None, "", "None"]:
+            return str(value).strip()
+    return ""
+
+
 def detectar_planta_en_texto(text: str) -> str:
     normalized = normalize_text(text)
     for planta_id, cfg in PLANTAS.items():
@@ -470,14 +475,6 @@ def detectar_planta_en_texto(text: str) -> str:
             if normalize_text(keyword) in normalized:
                 return planta_id
     return "DESCONOCIDA"
-
-
-def get_tipo_fichaje_value(fichaje: Dict[str, Any]) -> str:
-    for key in ["tipo", "Tipo", "tipo_id", "id_tipo", "tipo_fichaje", "Tipo fichaje"]:
-        value = fichaje.get(key)
-        if value not in [None, "", "None"]:
-            return str(value).strip()
-    return ""
 
 
 def build_employee_lookup(empleados: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -490,10 +487,6 @@ def build_employee_lookup(empleados: List[Dict[str, Any]]) -> Dict[str, Dict[str
 
 
 def build_plant_coords_from_sedes(sedes: List[Dict[str, Any]]) -> Dict[str, Tuple[float, float]]:
-    """
-    Intenta obtener coordenadas P2/P3 desde /exportacion/sedes.
-    Si no existen o no coinciden nombres, usa PLANT_COORDS_MANUAL.
-    """
     result: Dict[str, Tuple[float, float]] = {}
 
     for sede in sedes:
@@ -509,8 +502,8 @@ def build_plant_coords_from_sedes(sedes: List[Dict[str, Any]]) -> Dict[str, Tupl
 
         result[planta] = (lat, lon)
 
-    # Las coordenadas manuales tienen prioridad sobre las de /exportacion/sedes.
-    # Así evitamos que una sede mal configurada haga calcular distancias erróneas.
+    # Las coordenadas manuales prevalecen sobre las de CRECE, porque ya hemos visto
+    # que en P3 la referencia automática podía ser incorrecta.
     for planta, coords in PLANT_COORDS_MANUAL.items():
         if coords is not None:
             result[planta] = coords
@@ -546,21 +539,25 @@ def detectar_planta_fichaje(
     emp: Optional[Dict[str, Any]],
     sedes_lookup: Dict[str, str],
     plant_coords: Dict[str, Tuple[float, float]],
-    tipos_fichaje_lookup: Dict[str, str],
 ) -> Tuple[str, str, Optional[float]]:
     """
     Prioridad:
-    1) Tipo de fichaje / nombre del tipo de fichaje.
+    1) Campo tipo, si viene como texto P2/P3 o coincide con mapeo manual.
     2) Texto del fichaje: centro / ubicación / terminal.
     3) GPS del fichaje móvil.
     4) Sede asignada del empleado.
     """
     tipo_raw = get_tipo_fichaje_value(fichaje)
-    tipo_nombre = resolve_lookup_value(tipo_raw, tipos_fichaje_lookup)
+    tipo_norm = normalize_text(tipo_raw)
 
-    planta_tipo = detectar_planta_en_texto(f"{tipo_raw} {tipo_nombre}")
-    if planta_tipo != "DESCONOCIDA":
-        return planta_tipo, "tipo_fichaje", None
+    if tipo_raw:
+        mapped = TIPO_FICHAJE_TO_PLANTA.get(str(tipo_raw).strip())
+        if mapped in PLANTAS:
+            return mapped, "tipo_manual", None
+
+        planta_tipo = detectar_planta_en_texto(tipo_norm)
+        if planta_tipo != "DESCONOCIDA":
+            return planta_tipo, "tipo_fichaje", None
 
     text_fichaje = " ".join([
         str(fichaje.get("centro", "")),
@@ -593,7 +590,6 @@ def calcular_presencia_actual(
     departamentos_lookup: Dict[str, str],
     sedes_lookup: Dict[str, str],
     plant_coords: Dict[str, Tuple[float, float]],
-    tipos_fichaje_lookup: Dict[str, str],
     planta_objetivo: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     emp_lookup = build_employee_lookup(empleados)
@@ -613,22 +609,18 @@ def calcular_presencia_actual(
             emp=emp,
             sedes_lookup=sedes_lookup,
             plant_coords=plant_coords,
-            tipos_fichaje_lookup=tipos_fichaje_lookup,
         )
 
         lat, lon = extract_lat_lon(f)
-        tipo_raw = get_tipo_fichaje_value(f)
-        tipo_nombre = resolve_lookup_value(tipo_raw, tipos_fichaje_lookup)
 
         rows.append({
             "nif": nif,
             "fecha": fecha,
             "direccion": direccion,
+            "tipo": get_tipo_fichaje_value(f),
             "planta_fichaje": planta,
             "fuente_planta": fuente,
             "distancia_m": distancia,
-            "tipo": tipo_raw,
-            "tipo_nombre": tipo_nombre,
             "centro": f.get("centro", ""),
             "ubicacion": f.get("ubicacion", ""),
             "terminal": f.get("terminal", ""),
@@ -684,10 +676,9 @@ def calcular_presencia_actual(
             "NIF": nif,
             "Nº empleado": num_empleado,
             "Último movimiento": direccion.lower(),
+            "Tipo fichaje": row.get("tipo", ""),
             "Planta detectada": planta_actual,
             "Fuente planta": row.get("fuente_planta", ""),
-            "Tipo": row.get("tipo", ""),
-            "Tipo nombre": row.get("tipo_nombre", ""),
             "Distancia GPS": distancia_texto,
             "Sede ficha": sede_ficha,
             "Departamento": departamento,
@@ -760,11 +751,9 @@ def main() -> None:
                 empleados = client.export_empleados()
                 departamentos = client.export_departamentos()
                 sedes = client.export_sedes()
-                tipos_fichaje = client.export_tipos_fichaje()
 
                 departamentos_lookup = build_id_name_lookup(departamentos)
                 sedes_lookup = build_id_name_lookup(sedes)
-                tipos_fichaje_lookup = build_id_name_lookup(tipos_fichaje)
                 plant_coords = build_plant_coords_from_sedes(sedes)
 
                 fichajes, modo_consulta = client.export_fichajes_con_fallback(
@@ -780,7 +769,6 @@ def main() -> None:
                     departamentos_lookup=departamentos_lookup,
                     sedes_lookup=sedes_lookup,
                     plant_coords=plant_coords,
-                    tipos_fichaje_lookup=tipos_fichaje_lookup,
                     planta_objetivo=planta_objetivo,
                 )
 
@@ -790,7 +778,6 @@ def main() -> None:
                 "updated_at": now_madrid(),
                 "modo_consulta": modo_consulta,
                 "plant_coords": plant_coords,
-                "tipos_fichaje_lookup": tipos_fichaje_lookup,
             }
 
         except requests.HTTPError as exc:
@@ -829,14 +816,13 @@ def main() -> None:
 
     with st.expander("Validación técnica del cálculo", expanded=False):
         st.write("Esta tabla sirve para comprobar el último movimiento detectado por empleado.")
-        if not plant_coords:
+        if plant_coords:
+            st.caption(f"Coordenadas de planta usadas: {plant_coords}")
+        else:
             st.warning(
-                "No se han encontrado coordenadas de P2/P3 en /exportacion/sedes ni en PLANT_COORDS_MANUAL. "
+                "No se han encontrado coordenadas de P2/P3. "
                 "Los fichajes móviles sin terminal no podrán asignarse por GPS."
             )
-        else:
-            st.caption(f"Coordenadas de planta usadas: {plant_coords}")
-            st.caption(f"Tipos de fichaje cargados: {resultado.get('tipos_fichaje_lookup', {})}")
 
         if df_debug.empty:
             st.warning("No hay fichajes válidos en la ventana consultada.")
