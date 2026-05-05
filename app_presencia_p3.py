@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import base64
@@ -53,7 +52,6 @@ NOCTURNAL_LOOKBACK_DAYS = 1
 # lo marcamos internamente como aviso. No se oculta, porque sigue siendo el último estado real.
 MAX_OPEN_SHIFT_HOURS_WARNING = 18
 
-AUTO_REFRESH_SECONDS = 60
 
 
 # ============================================================
@@ -476,10 +474,7 @@ def render_header(planta_objetivo: str) -> None:
     )
 
     st.title(cfg["titulo"])
-    st.caption(
-        "Listado automático de empleados cuyo último fichaje abierto corresponde a esta planta. "
-        "La sede asignada del empleado no se usa para decidir dónde está trabajando."
-    )
+    # Pantalla limpia: sin texto descriptivo bajo el título.
 
 
 def render_status_cards(total: int, updated_at: pd.Timestamp, desde: str, hasta: str) -> None:
@@ -497,12 +492,6 @@ def main() -> None:
 
     render_header(planta_objetivo)
 
-    # Refresco automático simple sin dependencia externa.
-    st.markdown(
-        f"<meta http-equiv='refresh' content='{AUTO_REFRESH_SECONDS}'>",
-        unsafe_allow_html=True,
-    )
-
     today = now_madrid().normalize()
     fecha_hasta = today
     fecha_desde = today - pd.Timedelta(days=NOCTURNAL_LOOKBACK_DAYS)
@@ -510,69 +499,86 @@ def main() -> None:
     desde_str = date_str(fecha_desde)
     hasta_str = date_str(fecha_hasta)
 
-    left, right = st.columns([1, 4])
+    left, _ = st.columns([1, 4])
     with left:
         refresh = st.button("Actualizar ahora", use_container_width=True)
-    with right:
-        st.info(
-            "La app contempla entradas abiertas desde ayer para cubrir posibles turnos nocturnos futuros. "
-            "En la tabla solo aparecen quienes siguen con último fichaje de entrada."
+
+    if refresh:
+        try:
+            with st.spinner("Consultando CRECE Personas..."):
+                client = CreceClient()
+                empleados = client.export_empleados()
+                fichajes, modo_consulta = client.export_fichajes_con_fallback(
+                    desde_str,
+                    hasta_str,
+                    empleados,
+                    order="asc",
+                )
+                df_presencia, df_debug = calcular_presencia_actual(fichajes, empleados, planta_objetivo)
+
+            st.session_state["presencia_resultado"] = {
+                "df_presencia": df_presencia,
+                "df_debug": df_debug,
+                "updated_at": now_madrid(),
+                "desde_str": desde_str,
+                "hasta_str": hasta_str,
+                "modo_consulta": modo_consulta,
+            }
+
+        except requests.HTTPError as exc:
+            st.error("CRECE Personas ha devuelto un error HTTP.")
+            st.exception(exc)
+            return
+        except Exception as exc:
+            st.error("No se pudo calcular la presencia actual.")
+            st.exception(exc)
+            return
+
+    resultado = st.session_state.get("presencia_resultado")
+
+    if not resultado:
+        st.info("Pulsa Actualizar ahora para consultar la presencia actual.")
+        return
+
+    df_presencia = resultado["df_presencia"]
+    df_debug = resultado["df_debug"]
+    updated_at = resultado["updated_at"]
+    desde_resultado = resultado["desde_str"]
+    hasta_resultado = resultado["hasta_str"]
+
+    total = 0 if df_presencia.empty else len(df_presencia)
+    render_status_cards(total, updated_at, desde_resultado, hasta_resultado)
+
+    st.divider()
+
+    if df_presencia.empty:
+        st.success(f"No hay empleados trabajando ahora mismo en {PLANTAS[planta_objetivo]['nombre']}.")
+    else:
+        visible_cols = [
+            "Empleado",
+            "Nº empleado",
+            "Departamento",
+            "Sede ficha",
+            "Centro fichaje",
+            "Ubicación",
+            "Terminal",
+            "Aviso",
+        ]
+        existing_cols = [c for c in visible_cols if c in df_presencia.columns]
+        st.dataframe(
+            df_presencia[existing_cols],
+            use_container_width=True,
+            hide_index=True,
         )
 
-    try:
-        with st.spinner("Consultando CRECE Personas..."):
-            client = CreceClient()
-            empleados = client.export_empleados()
-            fichajes, modo_consulta = client.export_fichajes_con_fallback(
-                desde_str,
-                hasta_str,
-                empleados,
-                order="asc",
-            )
-            df_presencia, df_debug = calcular_presencia_actual(fichajes, empleados, planta_objetivo)
-
-        updated_at = now_madrid()
-        total = 0 if df_presencia.empty else len(df_presencia)
-        render_status_cards(total, updated_at, desde_str, hasta_str)
-        st.caption(f"Modo de consulta de fichajes: {modo_consulta}")
-
-        st.divider()
-
-        if df_presencia.empty:
-            st.success(f"No hay empleados trabajando ahora mismo en {PLANTAS[planta_objetivo]['nombre']}.")
+    with st.expander("Validación técnica del cálculo", expanded=False):
+        st.write(
+            "Esta tabla no es para recepción. Sirve para comprobar el último movimiento detectado por empleado."
+        )
+        if df_debug.empty:
+            st.warning("No hay fichajes válidos en la ventana consultada.")
         else:
-            visible_cols = [
-                "Empleado",
-                "Nº empleado",
-                "Departamento",
-                "Sede ficha",
-                "Centro fichaje",
-                "Ubicación",
-                "Terminal",
-                "Aviso",
-            ]
-            existing_cols = [c for c in visible_cols if c in df_presencia.columns]
-            st.dataframe(
-                df_presencia[existing_cols],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander("Validación técnica del cálculo", expanded=False):
-            st.write(
-                "Esta tabla no es para recepción. Sirve para comprobar el último movimiento detectado por empleado."
-            )
-            if df_debug.empty:
-                st.warning("No hay fichajes válidos en la ventana consultada.")
-            else:
-                st.dataframe(df_debug, use_container_width=True, hide_index=True)
-
-    except requests.HTTPError as exc:
-        st.error("CRECE Personas ha devuelto un error HTTP.")
-        st.exception(exc)
-    except Exception as exc:
-        st.error("No se pudo calcular la presencia actual.")
-        st.exception(exc)
+            st.dataframe(df_debug, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
