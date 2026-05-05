@@ -1,3 +1,31 @@
+"""
+APP PRESENCIA ACTUAL POR PLANTA - CRECE PERSONAS
+
+Objetivo:
+- Mostrar qué empleados están trabajando ahora mismo en una planta concreta.
+- No usa filtros visibles.
+- La planta se calcula por el último fichaje abierto, no por la sede asignada al empleado.
+- Preparada para turnos nocturnos: consulta desde ayer hasta hoy.
+
+Uso recomendado:
+1) Copiar este archivo como:
+   - app_presencia_p2.py
+   - app_presencia_p3.py
+
+2) En cada archivo cambiar PLANTA_OBJETIVO:
+   - P2 para COMARCA II
+   - P3 para UHARTE
+
+3) Ejecutar:
+   streamlit run app_presencia_p2.py
+   streamlit run app_presencia_p3.py
+
+Secrets esperados en .streamlit/secrets.toml:
+API_TOKEN = "..."
+APP_KEY_B64 = "..."
+CRECE_BASE_URL = "https://sincronizaciones.crecepersonas.es/api"
+"""
+
 from __future__ import annotations
 
 import base64
@@ -26,6 +54,9 @@ except ImportError:
 # CONFIGURACIÓN DE LA APP
 # ============================================================
 
+# Cambiar este valor en cada app.
+# app_presencia_p2.py -> "P2"
+# app_presencia_p3.py -> "P3"
 PLANTA_OBJETIVO = "P3"
 
 PLANTAS = {
