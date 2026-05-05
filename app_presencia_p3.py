@@ -1,26 +1,29 @@
 """
 APP PRESENCIA ACTUAL POR PLANTA - CRECE PERSONAS
 
-Objetivo:
-- Mostrar qué empleados están trabajando ahora mismo en una planta concreta.
-- No usa filtros visibles.
-- La planta se calcula por el último fichaje abierto.
-- Prioridad de detección de planta:
-  1) tipo del fichaje si viene como texto P2/P3 o si coincide con mapeo manual
-  2) centro / ubicación / terminal del fichaje
-  3) coordenadas GPS del fichaje móvil contra la geocerca de P2/P3
-  4) sede asignada del empleado como último fallback
+Versión optimizada:
+- Pantalla limpia para usuario final.
+- Sin filtros.
+- Sin validación técnica visible por defecto.
+- Coordenadas exactas de P2 y P3 fijadas manualmente.
+- Carga más rápida usando caché para datos maestros.
+- Seguridad mejorada: no se muestran trazas técnicas al usuario final y se valida MAC del payload.
 - Preparada para turnos nocturnos: consulta desde ayer hasta hoy.
 
 Secrets esperados en .streamlit/secrets.toml:
 API_TOKEN = "..."
 APP_KEY_B64 = "..."
 CRECE_BASE_URL = "https://sincronizaciones.crecepersonas.es/api"
+
+Opcional:
+SHOW_DEBUG_PRESENCIA = false
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -55,12 +58,18 @@ PLANTAS = {
     "P2": {
         "titulo": "P2 COMARCA II",
         "nombre": "P2 COMARCA II",
-        "keywords": ["P2", "COMARCA", "COMARCA II"],
+        "keywords": ["P2", "COMARCA", "COMARCA II", "ESQUIROZ", "ESQUÍROZ"],
+        # Google Maps:
+        # Polígono Comarca II-a, 36, 31191 Esquíroz, Navarra
+        "coords": (42.7656803, -1.6615654),
     },
     "P3": {
         "titulo": "P3 UHARTE",
         "nombre": "P3 UHARTE",
-        "keywords": ["P3", "UHARTE", "HUARTE"],
+        "keywords": ["P3", "UHARTE", "HUARTE", "UHARTE-ARAKIL", "UHARTE ARAKIL"],
+        # Google Maps:
+        # Pol. Ind. Uharte-Arakil, Cam. Sargaitz, 31840, Navarra
+        "coords": (42.9201789, -1.9821119),
     },
 }
 
@@ -69,23 +78,15 @@ TIMEZONE = "Europe/Madrid"
 # Ventana de seguridad para turnos nocturnos.
 NOCTURNAL_LOOKBACK_DAYS = 1
 
-# Radio de geocerca. Ajustable según precisión real del GPS en móvil.
-GEOFENCE_RADIUS_METERS = 500
+# Radio de geocerca. 350 m suele ser suficiente para planta + margen GPS móvil.
+# Si veis fichajes móviles correctos que quedan fuera por precisión GPS, subir a 500.
+GEOFENCE_RADIUS_METERS = 350
 
-# Coordenadas manuales de planta.
-# P3 corregida con la ubicación real que has sacado desde CRECE/Google Maps.
-# Para P2, rellena aquí la coordenada real cuando la tengas.
-PLANT_COORDS_MANUAL: Dict[str, Optional[Tuple[float, float]]] = {
-    "P2": None,
-    "P3": (42.920013, -1.982135),
-}
-
-# Mapeo manual opcional de tipos de fichaje si en la API el campo tipo viene como ID numérico.
-# Ejemplo, si descubres que tipo=7 es P3:
-# TIPO_FICHAJE_TO_PLANTA = {"7": "P3", "8": "P2"}
-TIPO_FICHAJE_TO_PLANTA: Dict[str, str] = {}
-
+# Aviso interno solo para debug.
 MAX_OPEN_SHIFT_HOURS_WARNING = 18
+
+# Caché de datos maestros. Empleados/departamentos/sedes cambian poco.
+MASTER_DATA_TTL_SECONDS = 30 * 60
 
 
 # ============================================================
@@ -102,6 +103,13 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(name, default)
 
 
+def get_bool_secret(name: str, default: bool = False) -> bool:
+    value = get_secret(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+
+
 def normalize_nif(value: Any) -> str:
     if value is None:
         return ""
@@ -112,7 +120,14 @@ def normalize_text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).upper().strip()
-    text = text.replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
+    text = (
+        text.replace("Á", "A")
+        .replace("É", "E")
+        .replace("Í", "I")
+        .replace("Ó", "O")
+        .replace("Ú", "U")
+        .replace("Ñ", "N")
+    )
     return text
 
 
@@ -274,6 +289,10 @@ def deserialize_php_or_json(raw_text: str) -> Any:
 
 
 def decrypt_crece_payload(payload_text: str, app_key_b64: str) -> Any:
+    """
+    Desencripta payload CRECE: base64(JSON{iv,value,mac}) + AES-256-CBC.
+    Seguridad: valida MAC antes de desencriptar.
+    """
     if AES is None:
         raise RuntimeError("Falta pycryptodome. Instala: pip install pycryptodome")
 
@@ -291,10 +310,23 @@ def decrypt_crece_payload(payload_text: str, app_key_b64: str) -> Any:
 
     try:
         key = base64.b64decode(app_key_b64)
-        iv = base64.b64decode(payload["iv"])
-        encrypted_value = base64.b64decode(payload["value"])
+        iv_b64 = payload["iv"]
+        encrypted_value_b64 = payload["value"]
+        mac_received = str(payload["mac"])
+        iv = base64.b64decode(iv_b64)
+        encrypted_value = base64.b64decode(encrypted_value_b64)
     except Exception as exc:
         raise RuntimeError(f"No se pudo decodificar payload/key CRECE: {exc}") from exc
+
+    # Según el manual, el MAC se calcula con base64(iv) + value usando SHA256.
+    mac_expected = hmac.new(
+        key,
+        msg=(str(iv_b64) + str(encrypted_value_b64)).encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(mac_expected, mac_received):
+        raise RuntimeError("MAC inválido en respuesta CRECE")
 
     cipher = AES.new(key, AES.MODE_CBC, iv)
     decrypted = cipher.decrypt(encrypted_value)
@@ -335,9 +367,9 @@ class CreceClient:
         self.app_key_b64 = get_secret("APP_KEY_B64")
 
         if not self.api_token:
-            raise RuntimeError("Falta API_TOKEN en secrets.toml o variable de entorno")
+            raise RuntimeError("Falta API_TOKEN")
         if not self.app_key_b64:
-            raise RuntimeError("Falta APP_KEY_B64 en secrets.toml o variable de entorno")
+            raise RuntimeError("Falta APP_KEY_B64")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -345,14 +377,14 @@ class CreceClient:
             "Authorization": f"Bearer {self.api_token}",
         })
 
-    def post_export(self, endpoint: str, data: Dict[str, Any], timeout: int = 60) -> List[Dict[str, Any]]:
+    def post_export(self, endpoint: str, data: Dict[str, Any], timeout: int = 25) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         resp = self.session.post(url, data=data, timeout=timeout)
         resp.raise_for_status()
         decrypted = decrypt_crece_payload(resp.text, self.app_key_b64)
         return to_records(decrypted)
 
-    def get_export(self, endpoint: str, timeout: int = 60) -> List[Dict[str, Any]]:
+    def get_export(self, endpoint: str, timeout: int = 25) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         resp = self.session.get(url, timeout=timeout)
         resp.raise_for_status()
@@ -414,6 +446,33 @@ class CreceClient:
                     continue
 
             return all_fichajes, "por_empleado"
+
+
+@st.cache_data(ttl=MASTER_DATA_TTL_SECONDS, show_spinner=False)
+def load_master_data() -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
+    """
+    Datos maestros cacheados para acelerar la app:
+    - Empleados
+    - Departamentos
+    - Sedes
+
+    Si departamentos/sedes fallan, la app sigue funcionando con IDs/nombres disponibles.
+    """
+    client = CreceClient()
+
+    empleados = client.export_empleados()
+
+    try:
+        departamentos_lookup = build_id_name_lookup(client.export_departamentos())
+    except Exception:
+        departamentos_lookup = {}
+
+    try:
+        sedes_lookup = build_id_name_lookup(client.export_sedes())
+    except Exception:
+        sedes_lookup = {}
+
+    return empleados, departamentos_lookup, sedes_lookup
 
 
 # ============================================================
@@ -486,29 +545,12 @@ def build_employee_lookup(empleados: List[Dict[str, Any]]) -> Dict[str, Dict[str
     return lookup
 
 
-def build_plant_coords_from_sedes(sedes: List[Dict[str, Any]]) -> Dict[str, Tuple[float, float]]:
-    result: Dict[str, Tuple[float, float]] = {}
-
-    for sede in sedes:
-        name = get_record_name(sede)
-        planta = detectar_planta_en_texto(name)
-
-        if planta == "DESCONOCIDA":
-            continue
-
-        lat, lon = extract_lat_lon(sede)
-        if lat is None or lon is None:
-            continue
-
-        result[planta] = (lat, lon)
-
-    # Las coordenadas manuales prevalecen sobre las de CRECE, porque ya hemos visto
-    # que en P3 la referencia automática podía ser incorrecta.
-    for planta, coords in PLANT_COORDS_MANUAL.items():
-        if coords is not None:
-            result[planta] = coords
-
-    return result
+def get_plant_coords() -> Dict[str, Tuple[float, float]]:
+    return {
+        planta_id: cfg["coords"]
+        for planta_id, cfg in PLANTAS.items()
+        if isinstance(cfg.get("coords"), tuple)
+    }
 
 
 def detectar_planta_por_gps(
@@ -542,20 +584,14 @@ def detectar_planta_fichaje(
 ) -> Tuple[str, str, Optional[float]]:
     """
     Prioridad:
-    1) Campo tipo, si viene como texto P2/P3 o coincide con mapeo manual.
+    1) Campo tipo, si viene como texto P2/P3.
     2) Texto del fichaje: centro / ubicación / terminal.
     3) GPS del fichaje móvil.
     4) Sede asignada del empleado.
     """
     tipo_raw = get_tipo_fichaje_value(fichaje)
-    tipo_norm = normalize_text(tipo_raw)
-
     if tipo_raw:
-        mapped = TIPO_FICHAJE_TO_PLANTA.get(str(tipo_raw).strip())
-        if mapped in PLANTAS:
-            return mapped, "tipo_manual", None
-
-        planta_tipo = detectar_planta_en_texto(tipo_norm)
+        planta_tipo = detectar_planta_en_texto(tipo_raw)
         if planta_tipo != "DESCONOCIDA":
             return planta_tipo, "tipo_fichaje", None
 
@@ -589,13 +625,22 @@ def calcular_presencia_actual(
     empleados: List[Dict[str, Any]],
     departamentos_lookup: Dict[str, str],
     sedes_lookup: Dict[str, str],
-    plant_coords: Dict[str, Tuple[float, float]],
     planta_objetivo: str,
+    include_debug: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     emp_lookup = build_employee_lookup(empleados)
+    plant_coords = get_plant_coords()
 
     rows = []
+    seen_ids = set()
+
     for f in fichajes:
+        fichaje_id = str(f.get("id") or f.get("ID") or "")
+        if fichaje_id:
+            if fichaje_id in seen_ids:
+                continue
+            seen_ids.add(fichaje_id)
+
         nif = get_fichaje_nif(f)
         fecha = parse_datetime(f.get("fecha"))
         direccion = normalize_text(f.get("direccion"))
@@ -626,7 +671,6 @@ def calcular_presencia_actual(
             "terminal": f.get("terminal", ""),
             "latitud": lat,
             "longitud": lon,
-            "raw": f,
         })
 
     if not rows:
@@ -653,48 +697,46 @@ def calcular_presencia_actual(
         departamento_raw = get_departamento_value(emp)
         departamento = resolve_lookup_value(departamento_raw, departamentos_lookup)
 
-        sede_raw = get_sede_value(emp)
-        sede_ficha = resolve_lookup_value(sede_raw, sedes_lookup)
-
-        aviso = ""
-        if direccion == "ENTRADA":
-            try:
-                horas_abierto = round((now_naive - fecha_entrada).total_seconds() / 3600, 2)
-                if horas_abierto > MAX_OPEN_SHIFT_HOURS_WARNING:
-                    aviso = f"Entrada abierta > {MAX_OPEN_SHIFT_HOURS_WARNING}h"
-            except Exception:
-                pass
-
-        distancia = row.get("distancia_m")
-        if pd.notna(distancia) and distancia is not None:
-            distancia_texto = f"{round(float(distancia), 0)} m"
-        else:
-            distancia_texto = ""
-
-        debug_rows.append({
-            "Empleado": nombre,
-            "NIF": nif,
-            "Nº empleado": num_empleado,
-            "Último movimiento": direccion.lower(),
-            "Tipo fichaje": row.get("tipo", ""),
-            "Planta detectada": planta_actual,
-            "Fuente planta": row.get("fuente_planta", ""),
-            "Distancia GPS": distancia_texto,
-            "Sede ficha": sede_ficha,
-            "Departamento": departamento,
-            "Centro": row.get("centro", ""),
-            "Ubicación": row.get("ubicacion", ""),
-            "Terminal": row.get("terminal", ""),
-            "Latitud": row.get("latitud", ""),
-            "Longitud": row.get("longitud", ""),
-            "Aviso": aviso,
-        })
-
         if direccion == "ENTRADA" and planta_actual == planta_objetivo:
             output_rows.append({
                 "Empleado": nombre,
                 "Nº empleado": num_empleado,
                 "Departamento": departamento,
+            })
+
+        if include_debug:
+            sede_raw = get_sede_value(emp)
+            sede_ficha = resolve_lookup_value(sede_raw, sedes_lookup)
+
+            aviso = ""
+            if direccion == "ENTRADA":
+                try:
+                    horas_abierto = round((now_naive - fecha_entrada).total_seconds() / 3600, 2)
+                    if horas_abierto > MAX_OPEN_SHIFT_HOURS_WARNING:
+                        aviso = f"Entrada abierta > {MAX_OPEN_SHIFT_HOURS_WARNING}h"
+                except Exception:
+                    pass
+
+            distancia = row.get("distancia_m")
+            distancia_texto = f"{round(float(distancia), 0)} m" if pd.notna(distancia) and distancia is not None else ""
+
+            debug_rows.append({
+                "Empleado": nombre,
+                "NIF": nif,
+                "Nº empleado": num_empleado,
+                "Último movimiento": direccion.lower(),
+                "Tipo fichaje": row.get("tipo", ""),
+                "Planta detectada": planta_actual,
+                "Fuente planta": row.get("fuente_planta", ""),
+                "Distancia GPS": distancia_texto,
+                "Sede ficha": sede_ficha,
+                "Departamento": departamento,
+                "Centro": row.get("centro", ""),
+                "Ubicación": row.get("ubicacion", ""),
+                "Terminal": row.get("terminal", ""),
+                "Latitud": row.get("latitud", ""),
+                "Longitud": row.get("longitud", ""),
+                "Aviso": aviso,
             })
 
     df_presencia = pd.DataFrame(output_rows)
@@ -729,8 +771,10 @@ def render_status_cards(total: int, updated_at: pd.Timestamp) -> None:
 def main() -> None:
     planta_objetivo = normalize_text(PLANTA_OBJETIVO)
     if planta_objetivo not in PLANTAS:
-        st.error(f"PLANTA_OBJETIVO inválida: {PLANTA_OBJETIVO}. Usa P2 o P3.")
+        st.error("Configuración de planta inválida.")
         st.stop()
+
+    show_debug = get_bool_secret("SHOW_DEBUG_PRESENCIA", False)
 
     render_header(planta_objetivo)
 
@@ -745,17 +789,10 @@ def main() -> None:
 
     if refresh:
         try:
-            with st.spinner("Consultando CRECE Personas..."):
+            with st.spinner("Actualizando presencia..."):
+                empleados, departamentos_lookup, sedes_lookup = load_master_data()
+
                 client = CreceClient()
-
-                empleados = client.export_empleados()
-                departamentos = client.export_departamentos()
-                sedes = client.export_sedes()
-
-                departamentos_lookup = build_id_name_lookup(departamentos)
-                sedes_lookup = build_id_name_lookup(sedes)
-                plant_coords = build_plant_coords_from_sedes(sedes)
-
                 fichajes, modo_consulta = client.export_fichajes_con_fallback(
                     desde_str,
                     hasta_str,
@@ -768,8 +805,8 @@ def main() -> None:
                     empleados=empleados,
                     departamentos_lookup=departamentos_lookup,
                     sedes_lookup=sedes_lookup,
-                    plant_coords=plant_coords,
                     planta_objetivo=planta_objetivo,
+                    include_debug=show_debug,
                 )
 
             st.session_state["presencia_resultado"] = {
@@ -777,16 +814,13 @@ def main() -> None:
                 "df_debug": df_debug,
                 "updated_at": now_madrid(),
                 "modo_consulta": modo_consulta,
-                "plant_coords": plant_coords,
             }
 
-        except requests.HTTPError as exc:
-            st.error("CRECE Personas ha devuelto un error HTTP.")
-            st.exception(exc)
-            return
-        except Exception as exc:
-            st.error("No se pudo calcular la presencia actual.")
-            st.exception(exc)
+        except Exception:
+            # Seguridad: no mostramos traceback, URLs internas, ni detalles técnicos al usuario final.
+            st.error("No se ha podido actualizar la presencia. Inténtalo de nuevo en unos segundos.")
+            if show_debug:
+                st.exception(Exception("Error técnico oculto en modo usuario final. Revisa logs de Streamlit."))
             return
 
     resultado = st.session_state.get("presencia_resultado")
@@ -796,7 +830,6 @@ def main() -> None:
     df_presencia = resultado["df_presencia"]
     df_debug = resultado["df_debug"]
     updated_at = resultado["updated_at"]
-    plant_coords = resultado.get("plant_coords", {})
 
     total = 0 if df_presencia.empty else len(df_presencia)
     render_status_cards(total, updated_at)
@@ -814,20 +847,13 @@ def main() -> None:
             hide_index=True,
         )
 
-    with st.expander("Validación técnica del cálculo", expanded=False):
-        st.write("Esta tabla sirve para comprobar el último movimiento detectado por empleado.")
-        if plant_coords:
-            st.caption(f"Coordenadas de planta usadas: {plant_coords}")
-        else:
-            st.warning(
-                "No se han encontrado coordenadas de P2/P3. "
-                "Los fichajes móviles sin terminal no podrán asignarse por GPS."
-            )
-
-        if df_debug.empty:
-            st.warning("No hay fichajes válidos en la ventana consultada.")
-        else:
-            st.dataframe(df_debug, use_container_width=True, hide_index=True)
+    if show_debug:
+        with st.expander("Validación técnica del cálculo", expanded=False):
+            st.caption(f"Coordenadas usadas: {get_plant_coords()}")
+            if df_debug.empty:
+                st.warning("No hay fichajes válidos en la ventana consultada.")
+            else:
+                st.dataframe(df_debug, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
