@@ -2,8 +2,9 @@
 APP PRESENCIA ACTUAL POR PLANTA — CRECE PERSONAS
 ================================================
 
-Misma app para P2 COMARCA II y P3 UHARTE. La planta se selecciona con el secret
-PLANTA_OBJETIVO (o, en su defecto, la constante PLANTA_OBJETIVO_DEFAULT más abajo).
+Misma app para P2 COMARCA II y P3 UHARTE. Lo único que cambia entre
+app_presencia_p2.py y app_presencia_p3.py es la constante PLANTA_OBJETIVO
+en la sección "CONFIGURACIÓN".
 
 Optimización clave
 ------------------
@@ -24,7 +25,6 @@ Secrets esperados (.streamlit/secrets.toml)
     API_TOKEN            = "..."
     APP_KEY_B64          = "..."
     CRECE_BASE_URL       = "https://sincronizaciones.crecepersonas.es/api"
-    PLANTA_OBJETIVO      = "P2"     # opcional ("P2" | "P3")
     SHOW_DEBUG_PRESENCIA = false    # opcional
 """
 
@@ -59,7 +59,10 @@ except ImportError:
 # CONFIGURACIÓN
 # ============================================================
 
-PLANTA_OBJETIVO_DEFAULT = "P3"   # se usa si el secret PLANTA_OBJETIVO no existe
+# Cambiar este valor en cada app:
+#   app_presencia_p2.py -> "P2"
+#   app_presencia_p3.py -> "P3"
+PLANTA_OBJETIVO = "P3"
 
 PLANTAS = {
     "P2": {
@@ -549,17 +552,7 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
     desde = (today_md - timedelta(days=NOCTURNAL_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     hasta = today_md.strftime("%Y-%m-%d")
 
-    cols = st.columns([2, 2, 6])
-    refresh = cols[0].button("Actualizar ahora", use_container_width=True, type="primary")
-    forzar = cols[1].button(
-        "Forzar refresco",
-        use_container_width=True,
-        help="Ignora todas las cachés. Uso ocasional si hay dudas con los datos.",
-    )
-
-    if forzar:
-        clear_caches()
-        refresh = True
+    refresh = st.button("Actualizar ahora", type="primary")
 
     if refresh:
         try:
@@ -616,6 +609,10 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
                 f"Modo consulta: {res['modo']}  ·  "
                 f"Versión caché: {str(res['version'])[:32]}"
             )
+            if st.button("Forzar refresco completo", help="Ignora todas las cachés."):
+                clear_caches()
+                st.session_state.pop("resultado", None)
+                st.rerun()
             if not res["debug"]:
                 st.warning("No hay fichajes válidos en la ventana consultada.")
             else:
@@ -623,7 +620,7 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
 
 
 def main() -> None:
-    planta = norm_text(get_secret("PLANTA_OBJETIVO", PLANTA_OBJETIVO_DEFAULT))
+    planta = norm_text(PLANTA_OBJETIVO)
     if planta not in PLANTAS:
         st.error("Configuración de planta inválida.")
         st.stop()
