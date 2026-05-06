@@ -84,6 +84,7 @@ GEOFENCE_RADIUS_METERS = 350
 EMPLEADOS_TTL = 60 * 60      # 1 h: cambian poco
 ULTIMO_FICHAJE_TTL = 5       # 5 s: agrupa ráfagas de pulsaciones simultáneas
 PRESENCIA_TTL = 60 * 5       # 5 min: tope de seguridad si todo lo demás fallase
+DIA_CERRADO_TTL = 60 * 60 * 24   # 24 h: días pasados ya no cambian
 REQUEST_TIMEOUT = 20
 
 
@@ -479,49 +480,76 @@ def calcular_presencia(fichajes: list[dict], empleados: list[dict], planta_objet
 # CACHÉS STREAMLIT (compartidas entre usuarios del mismo proceso)
 # ============================================================
 
+@st.cache_resource(show_spinner=False)
+def get_crece_client() -> CreceClient:
+    """
+    Cliente HTTP único por proceso.
+    Reutiliza la sesión de requests (HTTP keep-alive, sin reabrir TLS en cada llamada).
+    """
+    return CreceClient()
+
+
 @st.cache_data(ttl=EMPLEADOS_TTL, show_spinner=False)
 def cached_empleados() -> list[dict]:
-    return CreceClient().empleados()
+    return get_crece_client().empleados()
 
 
 @st.cache_data(ttl=ULTIMO_FICHAJE_TTL, show_spinner=False)
 def cached_ultimo_fichaje() -> str:
     """TTL muy corto: agrupa ráfagas de pulsaciones simultáneas en una sola llamada."""
-    return CreceClient().ultimo_fichaje()
+    return get_crece_client().ultimo_fichaje()
 
 
-@st.cache_data(ttl=PRESENCIA_TTL, show_spinner=False, max_entries=8)
-def cached_presencia(desde: str, hasta: str, version: str, planta_objetivo: str):
+@st.cache_data(ttl=DIA_CERRADO_TTL, show_spinner=False, max_entries=8)
+def cached_fichajes_dia(fecha: str, version: str) -> tuple[list[dict], str]:
     """
-    Calcula presencia y la cachea por (ventana_fechas, version_ultimo_fichaje, planta).
-    Mientras 'version' no cambie (= no ha fichado nadie nuevo), las siguientes
-    pulsaciones de "Actualizar ahora" devuelven al instante sin volver a llamar
-    a /exportacion/fichajes ni reprocesar nada.
+    Fichajes de un único día concreto, cacheados por (fecha, version).
+
+    Esta es la pieza clave para acelerar el caso "alguien acaba de fichar":
+    - Días pasados se cachean con version estable (no cambian más en todo el día).
+    - El día en curso se cachea con version = ultimo-fichaje, así sólo se
+      vuelve a descargar cuando alguien ficha de verdad.
     """
-    client = CreceClient()
+    client = get_crece_client()
     try:
-        fichajes = client.fichajes(desde, hasta)
-        modo = "global"
+        return client.fichajes(fecha, fecha), "global"
     except Exception:
         # Fallback documentado: si la consulta global falla, vamos NIF a NIF.
         empleados_local = cached_empleados()
         nifs = sorted({
             n for n in (get_nif(e, NIF_EMPLEADO_KEYS) for e in empleados_local) if n
         })
-        fichajes = []
+        result: list[dict] = []
         for nif in nifs:
             try:
-                fs = client.fichajes_por_nif(desde, hasta, nif)
+                fs = client.fichajes_por_nif(fecha, fecha, nif)
                 for f in fs:
                     if not get_nif(f, NIF_FICHAJE_KEYS):
                         f["nif"] = nif
-                fichajes.extend(fs)
+                result.extend(fs)
             except Exception:
                 continue
-        modo = "por_empleado"
+        return result, "por_empleado"
+
+
+@st.cache_data(ttl=PRESENCIA_TTL, show_spinner=False, max_entries=8)
+def cached_presencia(hoy_str: str, ayer_str: str, ultimo_fichaje: str, planta_objetivo: str):
+    """
+    Calcula presencia partiendo la consulta en dos:
+      - Fichajes de AYER: cacheados con version = hoy_str → se piden 1 vez al día.
+      - Fichajes de HOY:  cacheados con version = ultimo_fichaje → se piden sólo
+        cuando alguien ficha de verdad.
+
+    Cuando alguien ficha y pulsa "Actualizar", sólo se descarga el día en curso
+    (mucho más pequeño que ayer+hoy completos).
+    """
+    fichajes_ayer, modo_ayer = cached_fichajes_dia(ayer_str, hoy_str)
+    fichajes_hoy, modo_hoy = cached_fichajes_dia(hoy_str, ultimo_fichaje)
+    fichajes = fichajes_ayer + fichajes_hoy
 
     empleados = cached_empleados()
     presentes, debug = calcular_presencia(fichajes, empleados, planta_objetivo)
+    modo = "global" if modo_ayer == "global" and modo_hoy == "global" else "por_empleado"
     return presentes, debug, modo
 
 
@@ -529,6 +557,7 @@ def clear_caches() -> None:
     """Invalida todas las cachés. Sólo se usa desde 'Forzar refresco'."""
     cached_empleados.clear()
     cached_ultimo_fichaje.clear()
+    cached_fichajes_dia.clear()
     cached_presencia.clear()
 
 
@@ -549,31 +578,32 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
     st.title(cfg["titulo"])
 
     today_md = now_madrid().replace(hour=0, minute=0, second=0, microsecond=0)
-    desde = (today_md - timedelta(days=NOCTURNAL_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    hasta = today_md.strftime("%Y-%m-%d")
+    hoy_str = today_md.strftime("%Y-%m-%d")
+    ayer_str = (today_md - timedelta(days=NOCTURNAL_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 
     refresh = st.button("Actualizar ahora", type="primary")
 
     if refresh:
         try:
             with st.spinner("Actualizando presencia..."):
-                # Cheap-check: si nadie ha fichado, cached_presencia hace cache-hit.
+                # Cheap-check: invalida sólo el día EN CURSO cuando alguien ficha.
+                # Los fichajes de ayer permanecen cacheados hasta que cambia el día.
                 # Si /exportacion/ultimo-fichaje fallase, usamos un cubo de 1 minuto
                 # como versión sintética: peor caso = recalcular cada minuto.
                 try:
-                    version = cached_ultimo_fichaje() or f"fb-{int(time.time() // 60)}"
+                    ultimo = cached_ultimo_fichaje() or f"fb-{int(time.time() // 60)}"
                 except Exception:
-                    version = f"fb-{int(time.time() // 60)}"
+                    ultimo = f"fb-{int(time.time() // 60)}"
 
                 presentes, debug, modo = cached_presencia(
-                    desde, hasta, version, planta_objetivo,
+                    hoy_str, ayer_str, ultimo, planta_objetivo,
                 )
 
             st.session_state["resultado"] = {
                 "presentes": presentes,
                 "debug": debug,
                 "modo": modo,
-                "version": version,
+                "version": ultimo,
                 "updated_at": now_madrid(),
             }
         except Exception:
