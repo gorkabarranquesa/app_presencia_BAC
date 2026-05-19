@@ -83,7 +83,8 @@ GEOFENCE_RADIUS_METERS = 350
 
 EMPLEADOS_TTL = 60 * 60      # 1 h: cambian poco
 ULTIMO_FICHAJE_TTL = 5       # 5 s: agrupa ráfagas de pulsaciones simultáneas
-PRESENCIA_TTL = 60 * 5       # 5 min: tope de seguridad si todo lo demás fallase
+PRESENCIA_TTL = 60           # 1 min: red de seguridad si ultimo-fichaje no es fiable
+HOY_TTL = 60                 # 1 min: máximo tiempo que un fichaje nuevo puede tardar en aparecer
 DIA_CERRADO_TTL = 60 * 60 * 24   # 24 h: días pasados ya no cambian
 REQUEST_TIMEOUT = 20
 
@@ -500,21 +501,12 @@ def cached_ultimo_fichaje() -> str:
     return get_crece_client().ultimo_fichaje()
 
 
-@st.cache_data(ttl=DIA_CERRADO_TTL, show_spinner=False, max_entries=8)
-def cached_fichajes_dia(fecha: str, version: str) -> tuple[list[dict], str]:
-    """
-    Fichajes de un único día concreto, cacheados por (fecha, version).
-
-    Esta es la pieza clave para acelerar el caso "alguien acaba de fichar":
-    - Días pasados se cachean con version estable (no cambian más en todo el día).
-    - El día en curso se cachea con version = ultimo-fichaje, así sólo se
-      vuelve a descargar cuando alguien ficha de verdad.
-    """
+def _fetch_fichajes_dia(fecha: str) -> tuple[list[dict], str]:
+    """Función interna: descarga fichajes de un día concreto, con fallback NIF a NIF."""
     client = get_crece_client()
     try:
         return client.fichajes(fecha, fecha), "global"
     except Exception:
-        # Fallback documentado: si la consulta global falla, vamos NIF a NIF.
         empleados_local = cached_empleados()
         nifs = sorted({
             n for n in (get_nif(e, NIF_EMPLEADO_KEYS) for e in empleados_local) if n
@@ -532,19 +524,40 @@ def cached_fichajes_dia(fecha: str, version: str) -> tuple[list[dict], str]:
         return result, "por_empleado"
 
 
+@st.cache_data(ttl=DIA_CERRADO_TTL, show_spinner=False, max_entries=8)
+def cached_fichajes_cerrado(fecha: str, version_dia: str) -> tuple[list[dict], str]:
+    """
+    Fichajes de un día ya pasado. TTL 24 h.
+    version_dia = today_str: cambia 1 vez al día (al pasar la medianoche),
+    obligando a una sola re-consulta para consolidar fichajes tardíos.
+    """
+    return _fetch_fichajes_dia(fecha)
+
+
+@st.cache_data(ttl=HOY_TTL, show_spinner=False, max_entries=4)
+def cached_fichajes_hoy(fecha: str, version: str) -> tuple[list[dict], str]:
+    """
+    Fichajes del día en curso.
+    Idealmente version = ultimo-fichaje, que cambia cuando alguien ficha.
+    TTL corto (60 s) como RED DE SEGURIDAD: aunque ultimo-fichaje falle o
+    devuelva siempre el mismo valor, este TTL garantiza que los datos se
+    refrescan al menos cada minuto.
+    """
+    return _fetch_fichajes_dia(fecha)
+
+
 @st.cache_data(ttl=PRESENCIA_TTL, show_spinner=False, max_entries=8)
 def cached_presencia(hoy_str: str, ayer_str: str, ultimo_fichaje: str, planta_objetivo: str):
     """
     Calcula presencia partiendo la consulta en dos:
       - Fichajes de AYER: cacheados con version = hoy_str → se piden 1 vez al día.
-      - Fichajes de HOY:  cacheados con version = ultimo_fichaje → se piden sólo
-        cuando alguien ficha de verdad.
+      - Fichajes de HOY:  cacheados con version = ultimo_fichaje + TTL corto.
 
     Cuando alguien ficha y pulsa "Actualizar", sólo se descarga el día en curso
     (mucho más pequeño que ayer+hoy completos).
     """
-    fichajes_ayer, modo_ayer = cached_fichajes_dia(ayer_str, hoy_str)
-    fichajes_hoy, modo_hoy = cached_fichajes_dia(hoy_str, ultimo_fichaje)
+    fichajes_ayer, modo_ayer = cached_fichajes_cerrado(ayer_str, hoy_str)
+    fichajes_hoy, modo_hoy = cached_fichajes_hoy(hoy_str, ultimo_fichaje)
     fichajes = fichajes_ayer + fichajes_hoy
 
     empleados = cached_empleados()
@@ -557,7 +570,8 @@ def clear_caches() -> None:
     """Invalida todas las cachés. Sólo se usa desde 'Forzar refresco'."""
     cached_empleados.clear()
     cached_ultimo_fichaje.clear()
-    cached_fichajes_dia.clear()
+    cached_fichajes_cerrado.clear()
+    cached_fichajes_hoy.clear()
     cached_presencia.clear()
 
 
@@ -637,7 +651,13 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
         with st.expander("Validación técnica del cálculo", expanded=False):
             st.caption(
                 f"Modo consulta: {res['modo']}  ·  "
-                f"Versión caché: {str(res['version'])[:32]}"
+                f"Valor ultimo-fichaje: {repr(res['version'])[:64]}"
+            )
+            st.caption(
+                "Si pulsando varias veces tras nuevos fichajes ves siempre el "
+                "mismo valor de ultimo-fichaje, ese endpoint no está sirviendo "
+                "como cheap-check; la red de seguridad (TTL hoy) refresca "
+                f"como mucho cada {HOY_TTL}s."
             )
             if st.button("Forzar refresco completo", help="Ignora todas las cachés."):
                 clear_caches()
