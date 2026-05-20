@@ -1083,11 +1083,134 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
                 )
 
 
+# ============================================================
+# PÁGINA DE SALIDA (la abre el visitante al escanear el QR)
+# ============================================================
+
+def render_salida(planta_objetivo: str) -> None:
+    """
+    Página accesible vía URL ?modo=salida.
+    El visitante ve la lista de externos actualmente en planta
+    (sólo de SU planta) y pulsa su nombre. La app hace POST al
+    formulario de salidas con su submission_id de entrada.
+    Pantalla optimizada para móvil: layout centrado, botones grandes.
+    """
+    cfg = PLANTAS[planta_objetivo]
+    st.set_page_config(
+        page_title=f"Salida — {cfg['titulo']}",
+        page_icon="🚪",
+        layout="centered",
+    )
+
+    # Si acaba de marcar salida, mostramos confirmación y nada más.
+    confirmacion = st.session_state.get("salida_confirmada")
+    if confirmacion:
+        st.markdown(
+            "<h1 style='text-align:center;color:#1a7f37;margin-top:2rem;'>"
+            "✅ Salida registrada</h1>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<h3 style='text-align:center;font-weight:normal;'>"
+            f"Hasta pronto, {confirmacion}</h3>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<p style='text-align:center;color:#666;'>"
+            f"{cfg['titulo']} · {now_madrid().strftime('%H:%M')}</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("&nbsp;")
+        if st.button("Registrar otra salida", use_container_width=True):
+            st.session_state.pop("salida_confirmada", None)
+            st.rerun()
+        return
+
+    st.markdown(
+        f"<h2 style='text-align:center;'>🚪 Marcar salida</h2>"
+        f"<p style='text-align:center;color:#666;margin-top:-0.5rem;'>{cfg['titulo']}</p>",
+        unsafe_allow_html=True,
+    )
+
+    today_md = now_madrid().replace(hour=0, minute=0, second=0, microsecond=0)
+    hoy_str = today_md.strftime("%Y-%m-%d")
+
+    try:
+        externos = cached_externos_hoy(hoy_str, planta_objetivo)
+    except Exception:
+        st.error(
+            "No se ha podido cargar la lista. Inténtalo de nuevo en unos "
+            "segundos o avisa al personal de planta."
+        )
+        return
+
+    if not externos:
+        st.info(
+            "No hay registros de entrada pendientes de marcar salida en "
+            f"{cfg['titulo']}."
+        )
+        st.caption(
+            "Si has entrado hoy y no aparece tu nombre, comprueba que estás "
+            "usando el QR de la planta correcta o avisa al personal."
+        )
+        return
+
+    st.markdown("**Pulsa tu nombre para registrar la salida:**")
+    st.markdown("&nbsp;")
+
+    for e in externos:
+        ts = parse_dt(e.get("created_at"))
+        hora = ts.strftime("%H:%M") if ts is not None else "?"
+        partes_detalle = [e.get("empresa") or "", f"entrada {hora}"]
+        if e.get("referencia"):
+            partes_detalle.insert(1, f"visita a {e['referencia']}")
+        label = f"{e['nombre']}\n\n{' · '.join(p for p in partes_detalle if p)}"
+
+        if st.button(label, use_container_width=True, key=f"sal_{e['id']}"):
+            try:
+                get_jotform_client().crear_salida(e["id"])
+                # Refrescamos la caché para que ya no aparezca en próximas pulsaciones.
+                cached_externos_hoy.clear()
+                st.session_state["salida_confirmada"] = e["nombre"]
+                st.rerun()
+            except Exception:
+                st.error(
+                    "No se ha podido registrar la salida. Inténtalo otra vez "
+                    "o avisa al personal de planta."
+                )
+
+    st.divider()
+    st.caption(
+        "¿No encuentras tu nombre? Verifica que estás escaneando el QR de "
+        "esta planta. Si has olvidado registrar la entrada, avisa al "
+        "personal antes de irte."
+    )
+
+
 def main() -> None:
     planta = norm_text(PLANTA_OBJETIVO)
     if planta not in PLANTAS:
         st.error("Configuración de planta inválida.")
         st.stop()
+
+    # Routing por query param. Una URL única por planta sirve para:
+    #   - vista principal (la tablet en la pared):       /
+    #   - pantalla de salida (el QR del visitante):      /?modo=salida
+    modo = ""
+    try:
+        modo = str(st.query_params.get("modo", "")).lower()
+    except Exception:
+        # Compatibilidad con Streamlit antiguo
+        try:
+            qp = st.experimental_get_query_params()
+            modo = str((qp.get("modo") or [""])[0]).lower()
+        except Exception:
+            pass
+
+    if modo == "salida":
+        render_salida(planta)
+        return
+
     show_debug = get_bool_secret("SHOW_DEBUG_PRESENCIA", False)
     render(planta, show_debug)
 
