@@ -84,6 +84,10 @@ PLANTAS = {
 }
 
 TIMEZONE = ZoneInfo("Europe/Madrid")
+# Jotform almacena los timestamps en Eastern Time (zona del datacenter).
+# Lo confirmamos por el panel de cuenta y por la diferencia observada de 6 h
+# entre la entrada real y created_at: 11:00 Madrid = 05:00 EDT.
+JOTFORM_TIMEZONE = ZoneInfo("America/New_York")
 NOCTURNAL_LOOKBACK_DAYS = 1
 GEOFENCE_RADIUS_METERS = 350
 
@@ -169,6 +173,33 @@ def parse_dt(value) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+def parse_jotform_dt(value) -> datetime | None:
+    """
+    Parsea un timestamp de Jotform tratándolo como Eastern Time
+    (zona del servidor de Jotform) y lo devuelve convertido a Madrid.
+    Si ya viene con timezone explícito (ISO con offset), lo respeta.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    # Intento 1: ISO con timezone explícito
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JOTFORM_TIMEZONE)
+        return dt.astimezone(TIMEZONE)
+    except ValueError:
+        pass
+    # Intento 2: formatos naive comunes; asumimos ET
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            naive = datetime.strptime(s, fmt)
+            return naive.replace(tzinfo=JOTFORM_TIMEZONE).astimezone(TIMEZONE)
+        except ValueError:
+            continue
+    return None
 
 
 def parse_float(value) -> float | None:
@@ -489,9 +520,16 @@ def parse_externo_submission(sub: dict) -> dict:
     planta_raw = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_PLANTA))
     motivo = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_MOTIVO))
     referencia = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_REFERENCIA))
+
+    # Conversión Jotform (Eastern Time) → Madrid para mostrar al usuario.
+    created_at_raw = sub.get("created_at", "")
+    dt_local = parse_jotform_dt(created_at_raw)
+    hora_entrada = dt_local.strftime("%H:%M") if dt_local else ""
+
     return {
         "id": str(sub.get("id", "")),
-        "created_at": sub.get("created_at", ""),
+        "created_at": created_at_raw,           # se mantiene crudo para debug
+        "hora_entrada": hora_entrada,           # ya en hora de Madrid, lista para UI
         "nombre": nombre or "(sin nombre)",
         "empresa": empresa,
         "planta_raw": planta_raw,
@@ -902,12 +940,8 @@ def render_externos_tabla(externos: list[dict]) -> None:
         return
     filas = []
     for e in externos:
-        hora = ""
-        ts = parse_dt(e.get("created_at"))
-        if ts is not None:
-            hora = ts.strftime("%H:%M")
         filas.append({
-            "Hora entrada": hora,
+            "Hora entrada": e.get("hora_entrada", ""),
             "Visitante": e.get("nombre", ""),
             "Empresa": e.get("empresa", ""),
             "Motivo": e.get("motivo", ""),
@@ -967,8 +1001,7 @@ def render_emergencia(planta_objetivo: str, res: dict) -> None:
             "Detalle": "",
         })
     for e in externos:
-        ts = parse_dt(e.get("created_at"))
-        hora = ts.strftime("%H:%M") if ts is not None else ""
+        hora = e.get("hora_entrada", "")
         detalle_partes = [p for p in [
             e.get("empresa"),
             f"visita a {e['referencia']}" if e.get("referencia") else "",
@@ -1184,8 +1217,7 @@ def render_salida(planta_objetivo: str) -> None:
     st.markdown("&nbsp;")
 
     for e in externos:
-        ts = parse_dt(e.get("created_at"))
-        hora = ts.strftime("%H:%M") if ts is not None else "?"
+        hora = e.get("hora_entrada") or "?"
         partes_detalle = [e.get("empresa") or "", f"entrada {hora}"]
         if e.get("referencia"):
             partes_detalle.insert(1, f"visita a {e['referencia']}")
