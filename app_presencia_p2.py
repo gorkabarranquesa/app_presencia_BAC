@@ -376,16 +376,24 @@ class JotformClient:
             params=params or {},
             timeout=REQUEST_TIMEOUT,
         )
-        r.raise_for_status()
+        if not r.ok:
+            raise RuntimeError(f"GET {path} -> HTTP {r.status_code}: {r.text[:300]}")
         return r.json() or {}
 
     def _post(self, path: str, data: dict) -> dict:
+        # Cinturón y tirantes: además del header APIKEY, mandamos la key como
+        # query param. Algunos endpoints de Jotform prefieren la segunda forma
+        # para escrituras y devuelven 401 si sólo va por header.
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        params = {"apiKey": self.api_key} if self.api_key else None
         r = self.session.post(
-            f"{self.base_url}/{path.lstrip('/')}",
+            url,
+            params=params,
             data=data,
             timeout=REQUEST_TIMEOUT,
         )
-        r.raise_for_status()
+        if not r.ok:
+            raise RuntimeError(f"POST {path} -> HTTP {r.status_code}: {r.text[:300]}")
         return r.json() or {}
 
     def submissions_desde(self, form_id: str, fecha_desde: str, limit: int = 200) -> list[dict]:
@@ -437,6 +445,28 @@ JF_FIELD_MOTIVO       = ("Motivo de la visita", "visit reason")
 JF_FIELD_REFERENCIA   = ("Persona de referencia",)
 
 
+def _jf_value_to_str(value) -> str:
+    """
+    Convierte una respuesta de Jotform a string legible.
+    Maneja los tres formatos que devuelve la API:
+      - string plano:            "Esquiroz"
+      - lista (radio, checkbox): ["Javier Mendinueta"]
+      - dict (campo nombre):     {"first": "Juan", "last": "García"}
+    """
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(_jf_value_to_str(v) for v in value if v not in (None, "")).strip()
+    if isinstance(value, dict):
+        # Campo de nombre completo
+        if any(k in value for k in ("first", "last", "middle")):
+            parts = [value.get("first", ""), value.get("middle", ""), value.get("last", "")]
+            return " ".join(str(p).strip() for p in parts if p).strip()
+        # Cualquier otro dict: unimos los valores no vacíos
+        return " ".join(str(v).strip() for v in value.values() if v).strip()
+    return str(value).strip()
+
+
 def _jf_find_answer(answers: dict, texts_buscados: tuple) -> object:
     """Busca un campo por coincidencia (case-insensitive) en su 'text' o 'name'."""
     if not isinstance(answers, dict):
@@ -451,22 +481,14 @@ def _jf_find_answer(answers: dict, texts_buscados: tuple) -> object:
     return None
 
 
-def _jf_nombre_completo(answer) -> str:
-    """El campo de nombre en Jotform puede venir como string o como dict {first,last,middle}."""
-    if isinstance(answer, dict):
-        parts = [answer.get("first", ""), answer.get("middle", ""), answer.get("last", "")]
-        return " ".join(p for p in parts if p).strip()
-    return str(answer or "").strip()
-
-
 def parse_externo_submission(sub: dict) -> dict:
     """Convierte una submission cruda de Jotform en un registro de externo."""
     answers = sub.get("answers", {}) if isinstance(sub, dict) else {}
-    nombre = _jf_nombre_completo(_jf_find_answer(answers, JF_FIELD_NOMBRE))
-    empresa = str(_jf_find_answer(answers, JF_FIELD_EMPRESA) or "").strip()
-    planta_raw = str(_jf_find_answer(answers, JF_FIELD_PLANTA) or "").strip()
-    motivo = str(_jf_find_answer(answers, JF_FIELD_MOTIVO) or "").strip()
-    referencia = str(_jf_find_answer(answers, JF_FIELD_REFERENCIA) or "").strip()
+    nombre = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_NOMBRE))
+    empresa = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_EMPRESA))
+    planta_raw = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_PLANTA))
+    motivo = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_MOTIVO))
+    referencia = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_REFERENCIA))
     return {
         "id": str(sub.get("id", "")),
         "created_at": sub.get("created_at", ""),
@@ -1083,11 +1105,139 @@ def render(planta_objetivo: str, show_debug: bool) -> None:
                 )
 
 
+# ============================================================
+# PÁGINA DE SALIDA (la abre el visitante al escanear el QR)
+# ============================================================
+
+def render_salida(planta_objetivo: str) -> None:
+    """
+    Página accesible vía URL ?modo=salida.
+    El visitante ve la lista de externos actualmente en planta
+    (sólo de SU planta) y pulsa su nombre. La app hace POST al
+    formulario de salidas con su submission_id de entrada.
+    Pantalla optimizada para móvil: layout centrado, botones grandes.
+    """
+    cfg = PLANTAS[planta_objetivo]
+    st.set_page_config(
+        page_title=f"Salida — {cfg['titulo']}",
+        page_icon="📋",
+        layout="centered",
+    )
+    show_debug = get_bool_secret("SHOW_DEBUG_PRESENCIA", False)
+
+    # Si acaba de marcar salida, mostramos confirmación y nada más.
+    confirmacion = st.session_state.get("salida_confirmada")
+    if confirmacion:
+        st.markdown(
+            "<h1 style='text-align:center;color:#1a7f37;margin-top:2rem;'>"
+            "✅ Salida registrada</h1>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<h3 style='text-align:center;font-weight:normal;'>"
+            f"Hasta pronto, {confirmacion}</h3>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<p style='text-align:center;color:#666;'>"
+            f"{cfg['titulo']} · {now_madrid().strftime('%H:%M')}</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("&nbsp;")
+        if st.button("Registrar otra salida", use_container_width=True):
+            st.session_state.pop("salida_confirmada", None)
+            st.rerun()
+        return
+
+    st.markdown(
+        f"<h2 style='text-align:center;'>Salida de personal externo</h2>"
+        f"<p style='text-align:center;color:#666;margin-top:-0.5rem;'>{cfg['titulo']}</p>",
+        unsafe_allow_html=True,
+    )
+
+    today_md = now_madrid().replace(hour=0, minute=0, second=0, microsecond=0)
+    hoy_str = today_md.strftime("%Y-%m-%d")
+
+    try:
+        externos = cached_externos_hoy(hoy_str, planta_objetivo)
+    except Exception as exc:
+        st.error(
+            "No se ha podido cargar la lista. Inténtalo de nuevo en unos "
+            "segundos o avisa al personal de planta."
+        )
+        if show_debug:
+            st.caption(f"Detalle técnico: {exc}")
+        return
+
+    if not externos:
+        st.info(
+            "No hay registros de entrada pendientes de marcar salida en "
+            f"{cfg['titulo']}."
+        )
+        st.caption(
+            "Si has entrado hoy y no aparece tu nombre, comprueba que estás "
+            "usando el QR de la planta correcta o avisa al personal."
+        )
+        return
+
+    st.markdown("**Pulsa tu nombre para registrar la salida:**")
+    st.markdown("&nbsp;")
+
+    for e in externos:
+        ts = parse_dt(e.get("created_at"))
+        hora = ts.strftime("%H:%M") if ts is not None else "?"
+        partes_detalle = [e.get("empresa") or "", f"entrada {hora}"]
+        if e.get("referencia"):
+            partes_detalle.insert(1, f"visita a {e['referencia']}")
+        label = f"{e['nombre']}\n\n{' · '.join(p for p in partes_detalle if p)}"
+
+        if st.button(label, use_container_width=True, key=f"sal_{e['id']}"):
+            try:
+                get_jotform_client().crear_salida(e["id"])
+                # Refrescamos la caché para que ya no aparezca en próximas pulsaciones.
+                cached_externos_hoy.clear()
+                st.session_state["salida_confirmada"] = e["nombre"]
+                st.rerun()
+            except Exception as exc:
+                st.error(
+                    "No se ha podido registrar la salida. Inténtalo otra vez "
+                    "o avisa al personal de planta."
+                )
+                if show_debug:
+                    st.caption(f"Detalle técnico: {exc}")
+
+    st.divider()
+    st.caption(
+        "¿No encuentras tu nombre? Verifica que estás escaneando el QR de "
+        "esta planta. Si has olvidado registrar la entrada, avisa al "
+        "personal antes de irte."
+    )
+
+
 def main() -> None:
     planta = norm_text(PLANTA_OBJETIVO)
     if planta not in PLANTAS:
         st.error("Configuración de planta inválida.")
         st.stop()
+
+    # Routing por query param. Una URL única por planta sirve para:
+    #   - vista principal (la tablet en la pared):       /
+    #   - pantalla de salida (el QR del visitante):      /?modo=salida
+    modo = ""
+    try:
+        modo = str(st.query_params.get("modo", "")).lower()
+    except Exception:
+        # Compatibilidad con Streamlit antiguo
+        try:
+            qp = st.experimental_get_query_params()
+            modo = str((qp.get("modo") or [""])[0]).lower()
+        except Exception:
+            pass
+
+    if modo == "salida":
+        render_salida(planta)
+        return
+
     show_debug = get_bool_secret("SHOW_DEBUG_PRESENCIA", False)
     render(planta, show_debug)
 
