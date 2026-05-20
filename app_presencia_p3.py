@@ -376,16 +376,24 @@ class JotformClient:
             params=params or {},
             timeout=REQUEST_TIMEOUT,
         )
-        r.raise_for_status()
+        if not r.ok:
+            raise RuntimeError(f"GET {path} -> HTTP {r.status_code}: {r.text[:300]}")
         return r.json() or {}
 
     def _post(self, path: str, data: dict) -> dict:
+        # Cinturón y tirantes: además del header APIKEY, mandamos la key como
+        # query param. Algunos endpoints de Jotform prefieren la segunda forma
+        # para escrituras y devuelven 401 si sólo va por header.
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        params = {"apiKey": self.api_key} if self.api_key else None
         r = self.session.post(
-            f"{self.base_url}/{path.lstrip('/')}",
+            url,
+            params=params,
             data=data,
             timeout=REQUEST_TIMEOUT,
         )
-        r.raise_for_status()
+        if not r.ok:
+            raise RuntimeError(f"POST {path} -> HTTP {r.status_code}: {r.text[:300]}")
         return r.json() or {}
 
     def submissions_desde(self, form_id: str, fecha_desde: str, limit: int = 200) -> list[dict]:
@@ -437,6 +445,28 @@ JF_FIELD_MOTIVO       = ("Motivo de la visita", "visit reason")
 JF_FIELD_REFERENCIA   = ("Persona de referencia",)
 
 
+def _jf_value_to_str(value) -> str:
+    """
+    Convierte una respuesta de Jotform a string legible.
+    Maneja los tres formatos que devuelve la API:
+      - string plano:            "Esquiroz"
+      - lista (radio, checkbox): ["Javier Mendinueta"]
+      - dict (campo nombre):     {"first": "Juan", "last": "García"}
+    """
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(_jf_value_to_str(v) for v in value if v not in (None, "")).strip()
+    if isinstance(value, dict):
+        # Campo de nombre completo
+        if any(k in value for k in ("first", "last", "middle")):
+            parts = [value.get("first", ""), value.get("middle", ""), value.get("last", "")]
+            return " ".join(str(p).strip() for p in parts if p).strip()
+        # Cualquier otro dict: unimos los valores no vacíos
+        return " ".join(str(v).strip() for v in value.values() if v).strip()
+    return str(value).strip()
+
+
 def _jf_find_answer(answers: dict, texts_buscados: tuple) -> object:
     """Busca un campo por coincidencia (case-insensitive) en su 'text' o 'name'."""
     if not isinstance(answers, dict):
@@ -451,22 +481,14 @@ def _jf_find_answer(answers: dict, texts_buscados: tuple) -> object:
     return None
 
 
-def _jf_nombre_completo(answer) -> str:
-    """El campo de nombre en Jotform puede venir como string o como dict {first,last,middle}."""
-    if isinstance(answer, dict):
-        parts = [answer.get("first", ""), answer.get("middle", ""), answer.get("last", "")]
-        return " ".join(p for p in parts if p).strip()
-    return str(answer or "").strip()
-
-
 def parse_externo_submission(sub: dict) -> dict:
     """Convierte una submission cruda de Jotform en un registro de externo."""
     answers = sub.get("answers", {}) if isinstance(sub, dict) else {}
-    nombre = _jf_nombre_completo(_jf_find_answer(answers, JF_FIELD_NOMBRE))
-    empresa = str(_jf_find_answer(answers, JF_FIELD_EMPRESA) or "").strip()
-    planta_raw = str(_jf_find_answer(answers, JF_FIELD_PLANTA) or "").strip()
-    motivo = str(_jf_find_answer(answers, JF_FIELD_MOTIVO) or "").strip()
-    referencia = str(_jf_find_answer(answers, JF_FIELD_REFERENCIA) or "").strip()
+    nombre = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_NOMBRE))
+    empresa = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_EMPRESA))
+    planta_raw = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_PLANTA))
+    motivo = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_MOTIVO))
+    referencia = _jf_value_to_str(_jf_find_answer(answers, JF_FIELD_REFERENCIA))
     return {
         "id": str(sub.get("id", "")),
         "created_at": sub.get("created_at", ""),
@@ -1098,9 +1120,10 @@ def render_salida(planta_objetivo: str) -> None:
     cfg = PLANTAS[planta_objetivo]
     st.set_page_config(
         page_title=f"Salida — {cfg['titulo']}",
-        page_icon="🚪",
+        page_icon="📋",
         layout="centered",
     )
+    show_debug = get_bool_secret("SHOW_DEBUG_PRESENCIA", False)
 
     # Si acaba de marcar salida, mostramos confirmación y nada más.
     confirmacion = st.session_state.get("salida_confirmada")
@@ -1127,7 +1150,7 @@ def render_salida(planta_objetivo: str) -> None:
         return
 
     st.markdown(
-        f"<h2 style='text-align:center;'>🚪 Marcar salida</h2>"
+        f"<h2 style='text-align:center;'>Salida de personal externo</h2>"
         f"<p style='text-align:center;color:#666;margin-top:-0.5rem;'>{cfg['titulo']}</p>",
         unsafe_allow_html=True,
     )
@@ -1137,11 +1160,13 @@ def render_salida(planta_objetivo: str) -> None:
 
     try:
         externos = cached_externos_hoy(hoy_str, planta_objetivo)
-    except Exception:
+    except Exception as exc:
         st.error(
             "No se ha podido cargar la lista. Inténtalo de nuevo en unos "
             "segundos o avisa al personal de planta."
         )
+        if show_debug:
+            st.caption(f"Detalle técnico: {exc}")
         return
 
     if not externos:
@@ -1173,11 +1198,13 @@ def render_salida(planta_objetivo: str) -> None:
                 cached_externos_hoy.clear()
                 st.session_state["salida_confirmada"] = e["nombre"]
                 st.rerun()
-            except Exception:
+            except Exception as exc:
                 st.error(
                     "No se ha podido registrar la salida. Inténtalo otra vez "
                     "o avisa al personal de planta."
                 )
+                if show_debug:
+                    st.caption(f"Detalle técnico: {exc}")
 
     st.divider()
     st.caption(
